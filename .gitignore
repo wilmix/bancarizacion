@@ -129,3 +129,6 @@ db_config.ini
 # IDE settings folders
 .vscode/
 .idea/
+# Bancarizacion project specific
+db_config.ini
+data/output/
