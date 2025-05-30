@@ -271,3 +271,181 @@ def get_sales_invoice_data(year, month, config_file_path="db_config.ini"):
 # Example of how to use the Excel writing part if needed separately
 # def generate_excel_report(data_to_write, output_path):
 # write_to_excel(data_to_write, output_path)
+
+def get_auxiliary_sales_data(year, month, config_file_path="db_config.ini"):
+    """
+    Fetches auxiliary sales data for bancarizacion for a given year and month.
+    """
+    db_params = None
+    cnx = None
+    try:
+        db_params = get_db_config_core(config_file_path)
+        cnx = connect_to_db(db_params)
+
+        query = """
+        SELECT
+            CONCAT(f.fechaFac, '-', ROUND(fs.montoTotal,0)) AS id,
+            2 AS tipoTransaccion,
+            1 AS formaPago,
+            f.ClienteNit AS nitCliente,
+            '' AS complemento,
+            f.ClienteFactura AS nombreRazonSocial,
+            CASE 
+                WHEN df.autorizacion = 'SIAT' THEN fs.cuf
+                ELSE df.autorizacion 
+            END AS codigoAutorizacion,
+            f.nFactura AS numeroFactura,
+            2 AS tipoDocumentoRespaldo,
+            f.nFactura AS numeroDocumentoRespaldo,
+            f.fechaFac AS fechaDocumentoRespaldo,
+            fs.montoTotal AS montoFacturadoVenta,
+            'COLOCAREXCEL' AS numeroContrato,
+            3 AS tipoDocumentoPago, /* deposito en cuenta*/
+            e.fecha AS fechaDocumentoPago,
+            b.cuenta AS numeroCuentaVendedor,
+            b.nit AS nitEntidadFinancieraAbono,
+            e.codigo AS numeroTransaccion,
+            IF(e.monto > fs.montoTotal AND f.pagada = 1, fs.montoTotal, e.monto) AS montoRecibido,
+            e.descripcion AS extractoDescripcion,
+            e.adicional AS extractoAdicional,
+            e.banco AS extractoBanco,
+            e.cheque AS extractoCheque,
+            e.referencia AS extractoReferencia,
+            %s AS gestion, /* Using @gestionPago for gestion */
+            e.id AS idExtracto,
+            /* e.codigo, -- This is duplicated by numeroTransaccion, aliasing to avoid confusion */
+            p.transferencia AS pagoTransferencia,
+            p.idPago AS idPago,
+            f.almacen AS almacen,
+            f.pagada AS pagada,
+            f.idFactura AS idFactura,
+            CASE
+                WHEN tp.tipoPago = 'CHEQUE' THEN 1
+                WHEN tp.tipoPago = 'TRANSFERENCIA' THEN 4
+                ELSE ''
+            END AS tipoDocPagoOriginal, /* Renamed to avoid conflict if 'tipoDocumentoPago' is used differently */
+            p.glosa AS pagoGlosa,
+            p.imagen AS pagoImagen
+        FROM
+            factura f
+            LEFT JOIN factura_siat fs ON fs.factura_id = f.idFactura
+            INNER JOIN datosfactura df ON df.idDatosFactura = f.lote
+            LEFT JOIN pago_factura pf ON pf.idFactura = f.idFactura
+            LEFT JOIN pago p ON p.idPago = pf.idPago
+            LEFT JOIN tipoPago tp ON tp.id = p.tipoPago
+            LEFT JOIN extractos e ON e.codigo = p.transferencia AND YEAR(e.fecha) = %s AND MONTH(e.fecha) = %s AND e.codigo<>''
+            LEFT JOIN bancos b ON b.id = e.banco
+        WHERE
+            YEAR(f.fechaFac) <= %s    AND 
+            f.anulada = 0
+            AND f.total >= 50000
+            AND f.nFactura > 0
+            AND YEAR(p.fechaPago) = %s
+            AND MONTH(p.fechaPago) = %s
+        ORDER BY f.fechaFac;
+        """
+        # Parameters for the query: @gestion, @gestionPago, @mesPago, @gestion, @gestionPago, @mesPago
+        # The query uses @gestion for YEAR(f.fechaFac) <= @gestion
+        # and @gestionPago, @mesPago for payment dates and extract dates.
+        # We'll use the 'year' parameter for all @gestion and @gestionPago instances,
+        # and 'month' for all @mesPago instances.
+        params = (year, year, month, year, year, month)
+        
+        print(f"Executing auxiliary sales data query for Year: {year}, Month: {month}")
+        results = fetch_data_from_db(cnx, query, params)
+        return results
+
+    except FileNotFoundError as e:
+        print(f"Configuration file error: {e}")
+        return None
+    except ValueError as e:
+        print(f"Configuration value error: {e}")
+        return None
+    except mysql.connector.Error as e:
+        print(f"Database error in get_auxiliary_sales_data: {e}")
+        return None
+    except Exception as e:
+        print(f"An unexpected error occurred in get_auxiliary_sales_data: {e}")
+        return None
+    finally:
+        if cnx and cnx.is_connected():
+            cnx.close()
+            print("Database connection closed for get_auxiliary_sales_data.")
+
+def process_zipped_contracts_excel(zip_file_path, sheet_name="Reporte Contrato Ventas"):
+    """
+    Extracts an Excel file from a zip archive, reads a specific sheet,
+    and filters the data based on contract state.
+    
+    Args:
+        zip_file_path (str): Path to the zip file containing the Excel file
+        sheet_name (str, optional): Name of the sheet to read. Defaults to "Reporte Contrato Ventas".
+    
+    Returns:
+        list: Filtered data rows with only PENDIENTE contracts and valid contract codes
+    """
+    import zipfile
+    import pandas as pd
+    import tempfile
+    import os
+    
+    try:
+        print(f"Processing zipped contracts Excel file: {zip_file_path}")
+        
+        # Create a temporary directory to extract files
+        with tempfile.TemporaryDirectory() as temp_dir:
+            # Extract the zip file
+            with zipfile.ZipFile(zip_file_path, 'r') as zip_ref:
+                print(f"Zip file contains: {zip_ref.namelist()}")
+                zip_ref.extractall(temp_dir)
+            
+            # Assuming the Excel file is named Contratos.xlsx within the zip
+            excel_file_path = os.path.join(temp_dir, "Contratos.xlsx")
+            if not os.path.exists(excel_file_path):
+                # Try to find any Excel file if the expected name is not found
+                excel_files = [f for f in os.listdir(temp_dir) if f.endswith('.xlsx')]
+                if excel_files:
+                    excel_file_path = os.path.join(temp_dir, excel_files[0])
+                    print(f"Using Excel file: {excel_files[0]}")
+                else:
+                    raise FileNotFoundError(f"No Excel file found in {zip_file_path}")
+            
+            # Read the Excel file
+            print(f"Reading Excel file: {excel_file_path}, sheet: {sheet_name}")
+            df = pd.read_excel(excel_file_path, sheet_name=sheet_name)
+            
+            # Clean and filter data
+            # First, remove rows that are just headers (contain "NRO CONTRATO/ACUERDO :")
+            print("Filtering out header rows...")
+            mask_headers = ~df.apply(
+                lambda row: any(str(val).strip().startswith("NRO CONTRATO/ACUERDO :") if isinstance(val, str) else False 
+                             for val in row), axis=1
+            )
+            df_no_headers = df[mask_headers]
+            
+            # Filter to keep only rows with "ESTADO CONTRATO= PENDIENTE"
+            print("Filtering for PENDIENTE contracts...")
+            # Create a mask to identify rows with "ESTADO CONTRATO= PENDIENTE"
+            mask_pendiente = df_no_headers.apply(
+                lambda row: any(str(val).strip() == "ESTADO CONTRATO= PENDIENTE" if isinstance(val, str) else False
+                             for val in row), axis=1
+            )
+            
+            # Filter out rows with "ESTADO CONTRATO=CONCLUIDO"
+            mask_not_concluido = ~df_no_headers.apply(
+                lambda row: any(str(val).strip() == "ESTADO CONTRATO=CONCLUIDO" if isinstance(val, str) else False
+                              for val in row), axis=1
+            )
+            
+            # Combine the masks
+            df_filtered = df_no_headers[mask_pendiente & mask_not_concluido]
+            
+            # Convert to list of dictionaries for consistency with other functions
+            filtered_data = df_filtered.to_dict('records')
+            
+            print(f"Found {len(filtered_data)} PENDIENTE contracts after filtering")
+            return filtered_data
+            
+    except Exception as e:
+        print(f"Error processing zipped contracts Excel file: {e}")
+        return None
